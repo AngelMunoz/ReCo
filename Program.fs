@@ -105,20 +105,21 @@ type JetStream =
     let token = defaultArg cancellationToken CancellationToken.None
     let handler, ws = prepareWebSocket()
 
-    do! ws.ConnectAsync(Uri(uri), new HttpMessageInvoker(handler), token)
+    try
+      do! ws.ConnectAsync(Uri(uri), new HttpMessageInvoker(handler), token)
 
-    yield! JetStream.startListening(ws, jsonDeserializer, token)
-
-    match ws.State with
-    | WebSocketState.Aborted
-    | WebSocketState.CloseReceived ->
-      // Notify that we finished abnormally
-      ws.Dispose()
-      handler.Dispose()
-      failwith "The connection was closed"
-    | _ ->
-      ws.Dispose()
-      handler.Dispose()
+      yield! JetStream.startListening(ws, jsonDeserializer, token)
+    finally
+      match ws.State with
+      | WebSocketState.Aborted
+      | WebSocketState.CloseReceived ->
+        // Notify that we finished abnormally
+        ws.Dispose()
+        handler.Dispose()
+        failwith "The connection was closed"
+      | _ ->
+        ws.Dispose()
+        handler.Dispose()
   }
 
 
