@@ -3,7 +3,6 @@ open System.Net.WebSockets
 open System.Net
 open System.Net.Http
 open System.Text.Json
-open System.Text.Json.Nodes
 open System.Text.Json.Serialization
 open System.Threading
 
@@ -13,14 +12,13 @@ open IcedTasks
 open IcedTasks.Polyfill.Async
 open System.IO.Pipelines
 open FsToolkit.ErrorHandling
-open System.Collections.Generic
 
 type Commit = {
   rev: string
   operation: string
   collection: string
   rkey: string
-  record: JsonNode option
+  record: JsonDocument option
   cid: string
 }
 
@@ -49,11 +47,8 @@ type Event = {
 module JetStream =
 
   let startListening
-    (
-      ws: ClientWebSocket,
-      jsonDeserializer: (ReadOnlyMemory<byte> -> 'T) option,
-      token
-    ) =
+    (uri: Uri, jsonDeserializer: (ReadOnlyMemory<byte> -> 'T) option, token)
+    =
     let pipe = Pipe()
 
     let inline deserialize memory =
@@ -71,8 +66,16 @@ module JetStream =
         )
 
     taskSeq {
+
+      use handler = new SocketsHttpHandler()
+      use ws = new ClientWebSocket()
+      ws.Options.HttpVersion <- HttpVersion.Version20
+      ws.Options.HttpVersionPolicy <- HttpVersionPolicy.RequestVersionOrHigher
+
+      do! ws.ConnectAsync(uri, new HttpMessageInvoker(handler), token)
+
       while ws.State = WebSocketState.Open do
-        let buffer = pipe.Writer.GetMemory(1024)
+        let buffer = pipe.Writer.GetMemory(512)
         let! result = ws.ReceiveAsync(buffer, token)
         pipe.Writer.Advance(result.Count)
 
@@ -89,39 +92,20 @@ module JetStream =
             Error(ex, json)
 
           pipe.Reader.AdvanceTo(read.Buffer.End)
+
+      match ws.State with
+      | WebSocketState.Aborted ->
+        // Notify that we finished abnormally
+        failwith "The connection was closed"
+      | _ -> ()
     }
-
-  let prepareWebSocket() =
-    let handler = new SocketsHttpHandler()
-    let ws = new ClientWebSocket()
-    ws.Options.HttpVersion <- HttpVersion.Version20
-    ws.Options.HttpVersionPolicy <- HttpVersionPolicy.RequestVersionOrHigher
-
-    handler, ws
-
 
 type JetStream =
 
-  static member toAsyncSeq(uri, ?jsonDeserializer, ?cancellationToken) = taskSeq {
+  static member toAsyncSeq(uri, ?jsonDeserializer, ?cancellationToken) =
     let token = defaultArg cancellationToken CancellationToken.None
-    let handler, ws = JetStream.prepareWebSocket()
 
-    try
-      do! ws.ConnectAsync(Uri(uri), new HttpMessageInvoker(handler), token)
-
-      yield! JetStream.startListening(ws, jsonDeserializer, token)
-    finally
-      match ws.State with
-      | WebSocketState.Aborted
-      | WebSocketState.CloseReceived ->
-        // Notify that we finished abnormally
-        ws.Dispose()
-        handler.Dispose()
-        failwith "The connection was closed"
-      | _ ->
-        ws.Dispose()
-        handler.Dispose()
-  }
+    JetStream.startListening(Uri(uri), jsonDeserializer, token)
 
 
   static member toObservable(uri, ?jsonDeserializer, ?cancellationToken) =
@@ -132,16 +116,15 @@ type JetStream =
 
           let work = async {
             try
-
-              let values =
+              do!
                 JetStream.toAsyncSeq(
                   uri,
                   ?jsonDeserializer = jsonDeserializer,
                   cancellationToken = cts.Token
                 )
+                |> TaskSeq.iter observer.OnNext
 
-              for value in values do
-                observer.OnNext(value)
+              observer.OnCompleted()
             with ex ->
               observer.OnError(ex)
           }
@@ -149,7 +132,9 @@ type JetStream =
           Async.StartImmediate(work, cts.Token)
 
           { new IDisposable with
-              member _.Dispose() = cts.Cancel()
+              member _.Dispose() =
+                cts.Cancel()
+                cts.Dispose()
           }
     }
 
@@ -162,7 +147,7 @@ let events =
   )
 
 let work =
-  JetStream.toAsyncSeq(
+  JetStream.toAsyncSeq<Event>(
     "wss://jetstream2.us-east.bsky.network/subscribe",
     cancellationToken = cts.Token
   )
