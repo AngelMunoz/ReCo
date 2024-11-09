@@ -13,6 +13,7 @@ open IcedTasks
 open IcedTasks.Polyfill.Async
 open System.IO.Pipelines
 open FsToolkit.ErrorHandling
+open System.Collections.Generic
 
 type Commit = {
   rev: string
@@ -45,23 +46,6 @@ type Event = {
   identity: Identity option
 }
 
-let prepareWebSocket() =
-  let handler = new SocketsHttpHandler()
-  let ws = new ClientWebSocket()
-  ws.Options.HttpVersion <- HttpVersion.Version20
-  ws.Options.HttpVersionPolicy <- HttpVersionPolicy.RequestVersionOrHigher
-
-  handler, ws
-
-let jsonOptions =
-  JsonSerializerOptions(
-    UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
-    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-  )
-
-
 module JetStream =
 
   let startListening
@@ -70,12 +54,21 @@ module JetStream =
       jsonDeserializer: (ReadOnlyMemory<byte> -> 'T) option,
       token
     ) =
-    let pipe = new Pipe()
+    let pipe = Pipe()
 
     let inline deserialize memory =
       match jsonDeserializer with
       | Some deserialize -> deserialize(memory)
-      | None -> JsonSerializer.Deserialize<'T>(memory.Span, jsonOptions)
+      | None ->
+        JsonSerializer.Deserialize<'T>(
+          memory.Span,
+          JsonSerializerOptions(
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+          )
+        )
 
     taskSeq {
       while ws.State = WebSocketState.Open do
@@ -98,12 +91,20 @@ module JetStream =
           pipe.Reader.AdvanceTo(read.Buffer.End)
     }
 
+  let prepareWebSocket() =
+    let handler = new SocketsHttpHandler()
+    let ws = new ClientWebSocket()
+    ws.Options.HttpVersion <- HttpVersion.Version20
+    ws.Options.HttpVersionPolicy <- HttpVersionPolicy.RequestVersionOrHigher
+
+    handler, ws
+
 
 type JetStream =
 
-  static member toTaskSeq(uri, ?jsonDeserializer, ?cancellationToken) = taskSeq {
+  static member toAsyncSeq(uri, ?jsonDeserializer, ?cancellationToken) = taskSeq {
     let token = defaultArg cancellationToken CancellationToken.None
-    let handler, ws = prepareWebSocket()
+    let handler, ws = JetStream.prepareWebSocket()
 
     try
       do! ws.ConnectAsync(Uri(uri), new HttpMessageInvoker(handler), token)
@@ -133,7 +134,7 @@ type JetStream =
             try
 
               let values =
-                JetStream.toTaskSeq(
+                JetStream.toAsyncSeq(
                   uri,
                   ?jsonDeserializer = jsonDeserializer,
                   cancellationToken = cts.Token
@@ -160,12 +161,18 @@ let events =
     cancellationToken = cts.Token
   )
 
-events
-// |> Observable.sample(TimeSpan.FromMilliseconds(720))
-|> Observable.add(fun values ->
-  match values with
-  | Ok value -> printfn $"%s{value.did} - %A{value.commit}"
-  | Error(ex, json) -> eprintfn $"%s{json}")
+let work =
+  JetStream.toAsyncSeq(
+    "wss://jetstream2.us-east.bsky.network/subscribe",
+    cancellationToken = cts.Token
+  )
+  |> TaskSeq.iter(fun value ->
+    match value with
+    | Ok value -> printfn $"%s{value.did} - %A{value.commit}"
+    | Error(ex, json) -> eprintfn $"%s{json}")
+  |> Async.AwaitTask
+
+Async.StartImmediate(work, cts.Token)
 
 Console.CancelKeyPress.Add(fun _ -> cts.Cancel())
 
