@@ -1,4 +1,4 @@
-﻿open System
+open System
 open System.Net.WebSockets
 open System.Net
 open System.Net.Http
@@ -12,6 +12,7 @@ open IcedTasks
 open IcedTasks.Polyfill.Async
 open System.IO.Pipelines
 open FsToolkit.ErrorHandling
+open System.Collections.ObjectModel
 
 type Commit = {
   rev: string
@@ -75,6 +76,15 @@ module JetStream =
       do! ws.ConnectAsync(uri, new HttpMessageInvoker(handler), token)
 
       while ws.State = WebSocketState.Open do
+        if token.IsCancellationRequested then
+          do!
+            ws.CloseAsync(
+              WebSocketCloseStatus.NormalClosure,
+              "Cancelled",
+              token
+            )
+        else
+
         let buffer = pipe.Writer.GetMemory(512)
         let! result = ws.ReceiveAsync(buffer, token)
         pipe.Writer.Advance(result.Count)
@@ -138,26 +148,39 @@ type JetStream =
           }
     }
 
+
 let cts = new CancellationTokenSource()
 
 let events =
   JetStream.toObservable<Event>(
-    "wss://jetstream2.us-east.bsky.network/subscribe",
+    "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post",
     cancellationToken = cts.Token
   )
 
-let work =
-  JetStream.toAsyncSeq<Event>(
-    "wss://jetstream2.us-east.bsky.network/subscribe",
-    cancellationToken = cts.Token
-  )
-  |> TaskSeq.iter(fun value ->
-    match value with
-    | Ok value -> printfn $"%s{value.did} - %A{value.commit}"
-    | Error(ex, json) -> eprintfn $"%s{json}")
-  |> Async.AwaitTask
+let buffered = events |> Observable.sample(TimeSpan.FromSeconds(1))
 
-Async.StartImmediate(work, cts.Token)
+
+let obs = ObservableCollection<Event>()
+
+buffered
+|> Observable.add(fun e ->
+  match e with
+  | Ok e ->
+    if obs.Count > 10 then
+      obs.RemoveAt(0)
+      obs.Add(e)
+    else
+      obs.Add(e)
+  | Error(ex, json) -> printfn "Error: %s" json)
+
+
+obs.CollectionChanged
+|> Event.add(fun e ->
+  printfn "Collection changed %A" e.Action
+
+  for i in obs do
+    printfn "%A -> %A" i (i.commit.Value.record.Value.RootElement.GetRawText()))
+
 
 Console.CancelKeyPress.Add(fun _ -> cts.Cancel())
 
